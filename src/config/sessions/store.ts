@@ -266,6 +266,25 @@ export function loadSessionStore(
     }
   }
 
+  // Apply entry-count maintenance eagerly at load time when mode is "enforce" and the
+  // store exceeds the configured cap. This catches files that grew unbounded before the
+  // enforce-default landed, or in environments where the gateway restarts frequently
+  // enough that write-path maintenance never fires (e.g. crash-restart loops).
+  // Only prune/cap — no file rotation here since this path is synchronous.
+  // Respects mode: "warn" is left untouched (user opted out of enforcement).
+  const loadMaintenance = resolveMaintenanceConfig();
+  if (loadMaintenance.mode !== "warn" && Object.keys(store).length > loadMaintenance.maxEntries) {
+    const beforeCount = Object.keys(store).length;
+    pruneStaleEntries(store, loadMaintenance.pruneAfterMs);
+    capEntryCount(store, loadMaintenance.maxEntries);
+    log.info("applied load-time maintenance to oversized session store", {
+      storePath,
+      before: beforeCount,
+      after: Object.keys(store).length,
+      maxEntries: loadMaintenance.maxEntries,
+    });
+  }
+
   // Cache the result if caching is enabled
   if (!opts.skipCache && isSessionStoreCacheEnabled()) {
     SESSION_STORE_CACHE.set(storePath, {
@@ -299,7 +318,7 @@ export function readSessionUpdatedAt(params: {
 const DEFAULT_SESSION_PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_SESSION_MAX_ENTRIES = 500;
 const DEFAULT_SESSION_ROTATE_BYTES = 10_485_760; // 10 MB
-const DEFAULT_SESSION_MAINTENANCE_MODE: SessionMaintenanceMode = "warn";
+const DEFAULT_SESSION_MAINTENANCE_MODE: SessionMaintenanceMode = "enforce";
 const DEFAULT_SESSION_DISK_BUDGET_HIGH_WATER_RATIO = 0.8;
 
 export type SessionMaintenanceWarning = {
