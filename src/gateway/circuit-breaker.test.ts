@@ -85,8 +85,8 @@ describe("CircuitBreaker", () => {
 
   it("allows requests in CLOSED and HALF_OPEN states", () => {
     const cb = new CircuitBreaker({
-      failureThreshold: 5,
-      successThreshold: 3,
+      failureThreshold: 3,
+      successThreshold: 2,
       timeoutMs: 100,
       halfOpenMaxRequests: 2,
     });
@@ -147,9 +147,9 @@ describe("CircuitBreaker", () => {
       halfOpenMaxRequests: 1,
     });
 
-    await expect(
-      cb.execute(() => Promise.reject(new Error("test error"))),
-    ).rejects.toThrow("test error");
+    await expect(cb.execute(() => Promise.reject(new Error("test error")))).rejects.toThrow(
+      "test error",
+    );
     expect(cb.getState()).toBe("OPEN");
   });
 
