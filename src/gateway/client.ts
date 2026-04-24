@@ -33,6 +33,7 @@ import {
   validateRequestFrame,
   validateResponseFrame,
 } from "./protocol/index.js";
+import { type CircuitBreakerConfig, type CircuitBreakerState, createCircuitBreaker } from "./circuit-breaker.js";
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -40,8 +41,12 @@ type Pending = {
   expectFinal: boolean;
 };
 
+type CircuitBreakerOptions = {
+  circuitBreaker?: Partial<CircuitBreakerConfig>;
+};
+
 export type GatewayClientOptions = {
-  url?: string; // ws://127.0.0.1:18789
+  url?: string;
   connectDelayMs?: number;
   tickWatchMinIntervalMs?: number;
   token?: string;
@@ -68,7 +73,7 @@ export type GatewayClientOptions = {
   onConnectError?: (err: Error) => void;
   onClose?: (code: number, reason: string) => void;
   onGap?: (info: { expected: number; received: number }) => void;
-};
+} & CircuitBreakerOptions;
 
 export const GATEWAY_CLOSE_CODE_HINTS: Readonly<Record<number, string>> = {
   1000: "normal closure",
@@ -91,38 +96,43 @@ export class GatewayClient {
   private connectNonce: string | null = null;
   private connectSent = false;
   private connectTimer: NodeJS.Timeout | null = null;
-  // Track last tick to detect silent stalls.
   private lastTick: number | null = null;
   private tickIntervalMs = 30_000;
   private tickTimer: NodeJS.Timeout | null = null;
+  private circuitBreaker: CircuitBreakerState | null = null;
 
   constructor(opts: GatewayClientOptions) {
     this.opts = {
       ...opts,
       deviceIdentity: opts.deviceIdentity ?? loadOrCreateDeviceIdentity(),
     };
+    this.circuitBreaker = createCircuitBreaker(opts.circuitBreaker);
   }
 
   start() {
     if (this.closed) {
       return;
     }
+
+    if (this.circuitBreaker && !this.circuitBreaker.isAvailable()) {
+      this.opts.onConnectError?.(
+        new Error("Circuit breaker open: gateway unavailable"),
+      );
+      return;
+    }
+
     const url = this.opts.url ?? "ws://127.0.0.1:18789";
     if (this.opts.tlsFingerprint && !url.startsWith("wss://")) {
       this.opts.onConnectError?.(new Error("gateway tls fingerprint requires wss:// gateway url"));
       return;
     }
 
-    // Security check: block ALL plaintext ws:// to non-loopback addresses (CWE-319, CVSS 9.8)
-    // This protects both credentials AND chat/conversation data from MITM attacks.
-    // Device tokens may be loaded later in sendConnect(), so we block regardless of hasCredentials.
     if (!isSecureWebSocketUrl(url)) {
-      // Safe hostname extraction - avoid throwing on malformed URLs in error path
       let displayHost = url;
       try {
         displayHost = new URL(url).hostname || url;
       } catch {
-        // Use raw URL if parsing fails
+        displayHost = url;
       }
       const error = new Error(
         `SECURITY ERROR: Cannot connect to "${displayHost}" over plaintext ws://. ` +
@@ -134,7 +144,7 @@ export class GatewayClient {
       this.opts.onConnectError?.(error);
       return;
     }
-    // Allow node screen snapshots and other large responses.
+
     const wsOptions: ClientOptions = {
       maxPayload: 25 * 1024 * 1024,
     };
@@ -159,7 +169,6 @@ export class GatewayClient {
           return new Error("gateway tls fingerprint mismatch");
         }
         return undefined;
-        // oxlint-disable-next-line typescript/no-explicit-any
       }) as any;
     }
     this.ws = new WebSocket(url, wsOptions);
@@ -179,9 +188,6 @@ export class GatewayClient {
     this.ws.on("close", (code, reason) => {
       const reasonText = rawDataToString(reason);
       this.ws = null;
-      // Clear persisted device auth state only when device-token auth was active.
-      // Shared token/password failures can return the same close reason but should
-      // not erase a valid cached device token.
       if (
         code === 1008 &&
         reasonText.toLowerCase().includes("device token mismatch") &&
@@ -203,12 +209,20 @@ export class GatewayClient {
           );
         }
       }
+      if (this.circuitBreaker) {
+        this.circuitBreaker.recordFailure(
+          new Error(`gateway closed (${code}): ${reasonText}`),
+        );
+      }
       this.flushPendingErrors(new Error(`gateway closed (${code}): ${reasonText}`));
       this.scheduleReconnect();
       this.opts.onClose?.(code, reasonText);
     });
     this.ws.on("error", (err) => {
       logDebug(`gateway client error: ${String(err)}`);
+      if (this.circuitBreaker) {
+        this.circuitBreaker.recordFailure(err);
+      }
       if (!this.connectSent) {
         this.opts.onConnectError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -247,12 +261,8 @@ export class GatewayClient {
     const storedToken = this.opts.deviceIdentity
       ? loadDeviceAuthToken({ deviceId: this.opts.deviceIdentity.deviceId, role })?.token
       : null;
-    // Keep shared gateway credentials explicit. Persisted per-device tokens only
-    // participate when no explicit shared token is provided.
     const resolvedDeviceToken =
       explicitDeviceToken ?? (!explicitGatewayToken ? (storedToken ?? undefined) : undefined);
-    // Legacy compatibility: keep `auth.token` populated for device-token auth when
-    // no explicit shared token is present.
     const authToken = explicitGatewayToken ?? resolvedDeviceToken;
     const authPassword = this.opts.password?.trim() || undefined;
     const auth =
@@ -331,6 +341,9 @@ export class GatewayClient {
         this.lastTick = Date.now();
         this.startTickWatch();
         this.opts.onHelloOk?.(helloOk);
+        if (this.circuitBreaker) {
+          this.circuitBreaker.recordSuccess();
+        }
       })
       .catch((err) => {
         this.opts.onConnectError?.(err instanceof Error ? err : new Error(String(err)));
@@ -340,11 +353,77 @@ export class GatewayClient {
         } else {
           logError(msg);
         }
+        if (this.circuitBreaker) {
+          this.circuitBreaker.recordFailure(err instanceof Error ? err : new Error(String(err)));
+        }
         this.ws?.close(1008, "connect failed");
       });
   }
 
-  private handleMessage(raw: string) {
+  private async requestWithCircuitBreaker<T = Record<string, unknown>>(
+    method: string,
+    params?: unknown,
+    opts?: { expectFinal?: boolean },
+  ): Promise<T> {
+    if (!this.circuitBreaker) {
+      return this.originalRequest(method, params, opts);
+    }
+
+    const available = await this.circuitBreaker.allowRequest();
+    if (!available) {
+      throw new Error("Circuit breaker open: gateway unavailable");
+    }
+
+    try {
+      const result = await this.originalRequest(method, params, opts);
+      this.circuitBreaker.recordSuccess();
+      return result;
+    } catch (error) {
+      this.circuitBreaker.recordFailure(error as Error);
+      throw error;
+    }
+  }
+
+  private async originalRequest<T = Record<string, unknown>>(
+    method: string,
+    params?: unknown,
+    opts?: { expectFinal?: boolean },
+  ): Promise<T> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("gateway not connected");
+    }
+    const id = randomUUID();
+    const frame: RequestFrame = { type: "req", id, method, params };
+    if (!validateRequestFrame(frame)) {
+      throw new Error(
+        `invalid request frame: ${JSON.stringify(validateRequestFrame.errors, null, 2)}`,
+      );
+    }
+    const expectFinal = opts?.expectFinal === true;
+    const p = new Promise<T>((resolve, reject) => {
+      this.pending.set(id, {
+        resolve: (value) => resolve(value as T),
+        reject,
+        expectFinal,
+      });
+    });
+    this.ws.send(JSON.stringify(frame));
+    return p;
+  }
+
+  async request<T = Record<string, unknown>>(
+    method: string,
+    params?: unknown,
+    opts?: { expectFinal?: boolean },
+  ): Promise<T> {
+    return this.requestWithCircuitBreaker(method, params, opts);
+  }
+
+  getCircuitBreakerState(): CircuitBreakerState | null {
+    return this.circuitBreaker?.getState() ?? null;
+  }
+
+  private async handleMessage(raw: string) {
     try {
       const parsed = JSON.parse(raw);
       if (validateEventFrame(parsed)) {
@@ -379,7 +458,6 @@ export class GatewayClient {
         if (!pending) {
           return;
         }
-        // If the payload is an ack with status accepted, keep waiting for final.
         const payload = parsed.payload as { status?: unknown } | undefined;
         const status = payload?.status;
         if (pending.expectFinal && status === "accepted") {
@@ -486,32 +564,5 @@ export class GatewayClient {
       return new Error("gateway tls fingerprint mismatch");
     }
     return null;
-  }
-
-  async request<T = Record<string, unknown>>(
-    method: string,
-    params?: unknown,
-    opts?: { expectFinal?: boolean },
-  ): Promise<T> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("gateway not connected");
-    }
-    const id = randomUUID();
-    const frame: RequestFrame = { type: "req", id, method, params };
-    if (!validateRequestFrame(frame)) {
-      throw new Error(
-        `invalid request frame: ${JSON.stringify(validateRequestFrame.errors, null, 2)}`,
-      );
-    }
-    const expectFinal = opts?.expectFinal === true;
-    const p = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (value) => resolve(value as T),
-        reject,
-        expectFinal,
-      });
-    });
-    this.ws.send(JSON.stringify(frame));
-    return p;
   }
 }
